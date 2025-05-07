@@ -43,25 +43,43 @@ def main(config: DictConfig) -> None:
         # img_save_dir += f"{scenes_names[SCENE_ID]}_1"
         # os.makedirs(img_save_dir, exist_ok=True)
 
-        test_scene = os.path.join(config.data_paths.habitat_scene_dir, scene_name, scene_name + ".glb")
+        # For HM3D, check if the directory exists first
+        scene_dir = os.path.join(config.data_paths.habitat_scene_dir, scene_name)
+        print(f"Scene directory: {scene_dir}")
+        print(f"Directory exists: {os.path.exists(scene_dir)}")
+
+        # Then check what files are in the directory
+        if os.path.exists(scene_dir):
+            print(f"Files in directory: {os.listdir(scene_dir)}")
+            
+            # Look for .glb file
+            glb_files = [f for f in os.listdir(scene_dir) if f.endswith('.glb')]
+            if glb_files:
+                print(f"Found GLB files: {glb_files}")
+                test_scene = os.path.join(scene_dir, glb_files[0])
+            else:
+                print("No .glb files found in directory")
+                # Try constructing path based on directory name
+                test_scene = scene_dir
+        else:
+            print(f"Scene directory does not exist")
+            # Fall back to default path construction
+            test_scene = os.path.join(config.data_paths.habitat_scene_dir, scene_name, scene_name + ".glb")
+
+        print(f"Using scene path: {test_scene}")
 
         sim_setting = {
             "scene": test_scene,
             "default_agent": 0,
             "sensor_height": 1.5,
-            "color_sensor": True,
-            "depth_sensor": True,
-            "semantic_sensor": True,
-            "lidar_sensor": True,
-            "move_forward": 0.1,
-            "turn_left": 5,
-            "turn_right": 5,
-            "width": 1080,
-            "height": 720,
+            "color_sensor": True,  # Keep only essential sensors
+            "depth_sensor": False,  # Disable depth sensor initially
+            "semantic_sensor": False,  # Disable semantic sensors initially
+            "lidar_sensor": False,  # Disable lidar initially
+            "width": 640,  # Use lower resolution
+            "height": 480,
             "enable_physics": False,
             "seed": 42,
-            "lidar_fov": 360,
-            "depth_img_for_lidar_n": 20,
             "img_save_dir": scene_dir,
         }
 
