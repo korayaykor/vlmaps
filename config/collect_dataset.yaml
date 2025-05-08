@@ -1,8 +1,14 @@
+# collect_dataset.yaml
 defaults:
-  - data_paths: default
+  - _self_  # Fix for the Hydra warning
+
+# Your configuration values
+data_paths:
+  vlmaps_data_dir: "/vlmaps/drive/"
+  habitat_scene_dir: "/vlmaps/tasks/hm3d"  # Use absolute paths here too
 
 scene_names:
-  - 00000-kfPV7w3FaU5
+  - #kfPV7w3FaU5
 data_cfg:
   rgb: true
   depth: true
