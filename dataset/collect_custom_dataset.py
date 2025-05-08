@@ -13,8 +13,8 @@ from vlmaps.utils.habitat_utils import *
     config_name="collect_dataset.yaml",
 )
 def main(config: DictConfig) -> None:
-    os.environ["MAGNUM_LOG"] = "quiet"
-    os.environ["HABITAT_SIM_LOG"] = "quiet"
+    #os.environ["MAGNUM_LOG"] = "quiet"
+    #os.environ["HABITAT_SIM_LOG"] = "quiet"
     os.makedirs(config.data_paths.vlmaps_data_dir, exist_ok=True)
     dataset_dir = Path(config.data_paths.vlmaps_data_dir) / "vlmaps_dataset"
 
@@ -53,7 +53,7 @@ def main(config: DictConfig) -> None:
             print(f"Files in directory: {os.listdir(scene_dir)}")
             
             # Look for .glb file
-            glb_files = [f for f in os.listdir(scene_dir) if f.endswith('.glb')]
+            glb_files = [f for f in os.listdir(scene_dir) if f.endswith('.basis.glb')]
             if glb_files:
                 print(f"Found GLB files: {glb_files}")
                 test_scene = os.path.join(scene_dir, glb_files[0])
@@ -64,7 +64,7 @@ def main(config: DictConfig) -> None:
         else:
             print(f"Scene directory does not exist")
             # Fall back to default path construction
-            test_scene = os.path.join(config.data_paths.habitat_scene_dir, scene_name, scene_name + ".glb")
+            test_scene = os.path.join(config.data_paths.habitat_scene_dir, scene_name, scene_name + ".basis.glb")
 
         print(f"Using scene path: {test_scene}")
 
@@ -72,20 +72,29 @@ def main(config: DictConfig) -> None:
             "scene": test_scene,
             "default_agent": 0,
             "sensor_height": 1.5,
-            "color_sensor": True,  # Keep only essential sensors
-            "depth_sensor": False,  # Disable depth sensor initially
-            "semantic_sensor": False,  # Disable semantic sensors initially
-            "lidar_sensor": False,  # Disable lidar initially
-            "width": 640,  # Use lower resolution
-            "height": 480,
+            "color_sensor": True,
+            "depth_sensor": True,
+            "semantic_sensor": True,
+            "lidar_sensor": True,
+            "move_forward": 0.1,
+            "turn_left": 5,
+            "turn_right": 5,
+            "width": 1080,
+            "height": 720,
             "enable_physics": False,
             "seed": 42,
+            "lidar_fov": 360,
+            "depth_img_for_lidar_n": 20,
             "img_save_dir": scene_dir,
         }
+        
 
         # cfg = make_simple_cfg(sim_setting)
         cfg = make_cfg(sim_setting)
-
+        sim_cfg = habitat_sim.SimulatorConfiguration()
+        sim_cfg.scene_dataset_config_file = "/vlmaps/config/hm3d.scene_dataset_config.json"
+        sim_cfg.scene_id = "/vlmaps/tasks/hm3d/00000-kfPV7w3FaU5/kfPV7w3FaU5.basis.glb"
+        
         # create a simulator instance
         sim = habitat_sim.Simulator(cfg)
         scene = sim.semantic_scene
