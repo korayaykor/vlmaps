@@ -7,6 +7,10 @@ wandb
 images
 graphs
 data
+dataset/
+config/habitat_scene_dir/
+habitat_data_dir/
+vlmaps_data_dir/
 *obj_names_features.txt
 *place_names_features.txt
 *.npy

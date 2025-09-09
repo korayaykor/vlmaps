@@ -66,19 +66,11 @@ def main(config: DictConfig) -> None:
     os.environ["HABITAT_SIM_LOG"] = "quiet"
     os.makedirs(config.data_paths.vlmaps_data_dir, exist_ok=True)
     dataset_dir = Path(config.data_paths.vlmaps_data_dir)
-    os.makedirs(dataset_dir, exist_ok=True)
-    zip_filepath = dataset_dir / "vlmaps_dataset.zip"
-    if not zip_filepath.exists():
-        gdown.download(
-            "https://drive.google.com/file/d/1KaRi1VnY7C_TT1WckDWxHvP4v3MTNu1a/view?usp=sharing",
-            zip_filepath.as_posix(),
-            fuzzy=True,
-        )
-    # subprocess.run(["unzip", zip_filepath.as_posix(), "-d", dataset_dir.parent.as_posix()])
-    subprocess.run(["tar", "zxvf", zip_filepath.as_posix(), "--strip-components=1", "-C", dataset_dir.as_posix()])
-    subprocess.run(["rm", zip_filepath.as_posix()])
 
-    data_dirs = sorted([x for x in dataset_dir.iterdir() if x.is_dir()])
+
+    # The actual scene directories are inside vlmaps_dataset subdirectory
+    vlmaps_dataset_dir = dataset_dir / "vlmaps_dataset"
+    data_dirs = sorted([x for x in vlmaps_dataset_dir.iterdir() if x.is_dir()])
     if config.scene_names:
         data_dirs = sorted([dataset_dir / x for x in config.scene_names])
     pbar = tqdm(data_dirs)

@@ -1,2 +1,2 @@
-habitat_scene_dir: "tasks/hm3d"
-vlmaps_data_dir: "/vlmaps/drive/vlmaps_dataset/vlmaps_dataset"
+habitat_scene_dir: "/home/koray/vlmaps/habitat_data_dir"
+vlmaps_data_dir: "vlmaps_data_dir"
