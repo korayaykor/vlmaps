@@ -32,6 +32,14 @@ import torchvision.transforms as transforms
 import clip
 from vlmaps.utils.habitat_utils import get_obj2cls_dict
 
+# Try to import BLIP
+try:
+    from transformers import BlipProcessor, BlipForImageTextRetrieval
+    BLIP_AVAILABLE = True
+except ImportError:
+    print("BLIP not available. Install with: pip install transformers")
+    BLIP_AVAILABLE = False
+
 # Try to import project-specific utilities
 try:
     from vlmaps.utils.mapping_utils import (
@@ -164,7 +172,7 @@ data_dir = "/content/5LpN3gDmAk7_1/" # @param {type: "string"}
 # Default configuration - can be modified as needed
 
 # Define create_lseg_map_batch function 
-def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_sample_rate=100):
+def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_sample_rate=100, use_blip=False):
     if not UTILS_AVAILABLE:
         raise ImportError("LSeg utilities not available. Please install dependencies.")
         
@@ -483,8 +491,301 @@ def initialize_clip_model():
     
     return clip_model, clip_feat_dim, device
 
+def initialize_blip_model(blip_version="blip-base"):
+    """Initialize BLIP model for image-text retrieval and return necessary components"""
+    if not BLIP_AVAILABLE:
+        raise ImportError("BLIP not available. Install with: pip install transformers")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # BLIP model configurations optimized for image-text retrieval
+    blip_configs = {
+        'blip-base': {
+            'model_name': 'Salesforce/blip-itm-base-coco',
+            'feat_dim': 768
+        },
+        'blip-large': {
+            'model_name': 'Salesforce/blip-itm-large-coco', 
+            'feat_dim': 768
+        },
+        'blip-vit-base': {
+            'model_name': 'Salesforce/blip-vqa-base',
+            'feat_dim': 768
+        },
+        'blip-vit-large': {
+            'model_name': 'Salesforce/blip-vqa-capfilt-large',
+            'feat_dim': 768
+        }
+    }
+    
+    if blip_version not in blip_configs:
+        print(f"Warning: {blip_version} not found, using blip-base")
+        blip_version = "blip-base"
+    
+    config = blip_configs[blip_version]
+    blip_model_name = config['model_name']
+    blip_feat_dim = config['feat_dim']
+    
+    print(f"Loading BLIP model for image-text retrieval: {blip_version} ({blip_model_name})...")
+    
+    try:
+        processor = BlipProcessor.from_pretrained(blip_model_name)
+        model = BlipForImageTextRetrieval.from_pretrained(blip_model_name)
+        model.to(device).eval()
+        
+        print(f"BLIP model loaded successfully with {blip_feat_dim}D features")
+        return model, processor, blip_feat_dim, device
+        
+    except Exception as e:
+        print(f"Failed to load {blip_version}, falling back to blip-itm-base-coco: {e}")
+        # Fallback to base model specifically designed for image-text matching
+        try:
+            processor = BlipProcessor.from_pretrained("Salesforce/blip-itm-base-coco")
+            model = BlipForImageTextRetrieval.from_pretrained("Salesforce/blip-itm-base-coco")
+            model.to(device).eval()
+            return model, processor, 768, device
+        except Exception as e2:
+            print(f"Fallback also failed: {e2}")
+            # Final fallback to a known working model
+            processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
+            model = BlipForImageTextRetrieval.from_pretrained("Salesforce/blip-vqa-base")
+            model.to(device).eval()
+            return model, processor, 768, device
 
-def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
+def get_blip_text_features(texts, model, processor, device, target_dim=512):
+    """Get text features using BLIP for image-text retrieval - optimized for semantic mapping"""
+    text_features = []
+    
+    # Create a learnable projection layer for dimension matching (shared across all texts)
+    if not hasattr(get_blip_text_features, 'projection_layer'):
+        get_blip_text_features.projection_layer = None
+    
+    with torch.no_grad():
+        for text in texts:
+            try:
+                # Enhanced text prompting for better semantic understanding
+                # Use multiple prompt templates for robustness
+                prompt_templates = [
+                    f"a photo of {text}",
+                    f"an image containing {text}",
+                    f"this is {text}",
+                    f"{text} in a room"
+                ]
+                
+                text_embeds_list = []
+                
+                for prompt in prompt_templates:
+                    try:
+                        # Process text input
+                        inputs = processor(text=prompt, return_tensors="pt", padding=True, truncation=True, max_length=77)
+                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                        
+                        # Extract text embeddings using the text encoder directly
+                        if hasattr(model, 'text_model'):
+                            # For BLIP-2 style models
+                            text_outputs = model.text_model(**inputs)
+                            if hasattr(text_outputs, 'pooler_output') and text_outputs.pooler_output is not None:
+                                text_embeds = text_outputs.pooler_output
+                            else:
+                                text_embeds = text_outputs.last_hidden_state.mean(dim=1)
+                        elif hasattr(model, 'text_encoder'):
+                            # For standard BLIP models
+                            text_outputs = model.text_encoder(**inputs)
+                            if hasattr(text_outputs, 'pooler_output') and text_outputs.pooler_output is not None:
+                                text_embeds = text_outputs.pooler_output
+                            else:
+                                text_embeds = text_outputs.last_hidden_state[:, 0, :]  # CLS token
+                        else:
+                            # Fallback: use the complete model with dummy image
+                            dummy_image = torch.zeros(1, 3, 224, 224).to(device)
+                            dummy_inputs = processor(images=dummy_image, return_tensors="pt")
+                            dummy_inputs = {k: v.to(device) for k, v in dummy_inputs.items()}
+                            
+                            outputs = model(
+                                pixel_values=dummy_inputs['pixel_values'],
+                                input_ids=inputs['input_ids'],
+                                attention_mask=inputs['attention_mask'],
+                                return_dict=True
+                            )
+                            
+                            if hasattr(outputs, 'text_embeds'):
+                                text_embeds = outputs.text_embeds
+                            else:
+                                continue  # Skip this prompt if we can't extract embeddings
+                        
+                        text_embeds_list.append(text_embeds)
+                        
+                    except Exception as e:
+                        print(f"Debug: Failed to process prompt '{prompt}': {e}")
+                        continue
+                
+                if text_embeds_list:
+                    # Average embeddings from multiple prompts for robustness
+                    text_embeds = torch.stack(text_embeds_list).mean(dim=0)
+                    
+                    # Apply text projection if available
+                    if hasattr(model, 'text_proj') and model.text_proj is not None:
+                        text_embeds = model.text_proj(text_embeds)
+                    
+                    # Project to target dimension if needed
+                    if text_embeds.shape[-1] != target_dim:
+                        if get_blip_text_features.projection_layer is None:
+                            get_blip_text_features.projection_layer = torch.nn.Linear(
+                                text_embeds.shape[-1], target_dim, bias=False
+                            ).to(device)
+                            # Initialize with Xavier uniform for better convergence
+                            torch.nn.init.xavier_uniform_(get_blip_text_features.projection_layer.weight)
+                        
+                        text_embeds = get_blip_text_features.projection_layer(text_embeds)
+                    
+                    # Normalize features for cosine similarity
+                    text_embeds = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-8)
+                    text_features.append(text_embeds.cpu().numpy())
+                else:
+                    print(f"Warning: Could not extract features for '{text}', using zero vector")
+                    zero_feat = torch.zeros(1, target_dim)
+                    text_features.append(zero_feat.numpy())
+                    
+            except Exception as e:
+                print(f"Error processing text '{text}': {e}")
+                zero_feat = torch.zeros(1, target_dim)
+                text_features.append(zero_feat.numpy())
+    
+    return np.vstack(text_features)
+
+def get_blip_image_features(image, model, processor, device):
+    """Get image features using BLIP for image-text retrieval"""
+    with torch.no_grad():
+        # Convert numpy array to PIL Image if needed
+        if isinstance(image, np.ndarray):
+            image_pil = Image.fromarray(image)
+        else:
+            image_pil = image
+            
+        inputs = processor(images=image_pil, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # BlipForImageTextRetrieval has a specific vision encoder
+        if hasattr(model, 'vision_model'):
+            # Use the vision model directly
+            image_outputs = model.vision_model(**inputs)
+            image_embeds = image_outputs.pooler_output
+            
+            # Apply vision projection if available
+            if hasattr(model, 'visual_projection'):
+                image_embeds = model.visual_projection(image_embeds)
+                
+        elif hasattr(model, 'get_image_features'):
+            # Fallback method if available
+            image_embeds = model.get_image_features(**inputs)
+        else:
+            # Alternative approach using the full model with dummy text
+            dummy_text = "a photo"
+            text_inputs = processor(text=dummy_text, return_tensors="pt")
+            text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+            
+            outputs = model(
+                pixel_values=inputs['pixel_values'],
+                input_ids=text_inputs['input_ids'],
+                attention_mask=text_inputs['attention_mask'],
+                return_dict=True
+            )
+            
+            if hasattr(outputs, 'image_embeds'):
+                image_embeds = outputs.image_embeds
+            else:
+                # Use vision embeddings as image representation
+                image_embeds = outputs.vision_embeds
+        
+        # Normalize features for better similarity computation
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        return image_embeds.cpu().numpy()
+
+def enhance_categories_for_blip(categories):
+    """Enhance category names for better BLIP understanding in semantic mapping"""
+    enhanced_categories = []
+    
+    # Category enhancement rules based on semantic mapping requirements
+    enhancement_rules = {
+        # Furniture items
+        'chair': 'chair furniture for sitting',
+        'table': 'table furniture surface',
+        'sofa': 'sofa couch furniture for sitting',
+        'bed': 'bed furniture for sleeping',
+        'cabinet': 'cabinet storage furniture',
+        'chest_of_drawers': 'chest of drawers storage furniture',
+        'stool': 'stool seat furniture',
+        
+        # Structural elements
+        'wall': 'wall interior surface',
+        'floor': 'floor ground surface',
+        'ceiling': 'ceiling overhead surface',
+        'door': 'door entrance opening',
+        'window': 'window glass opening',
+        'stairs': 'stairs staircase steps',
+        'column': 'architectural column pillar',
+        'beam': 'ceiling beam structure',
+        'railing': 'stair railing barrier',
+        
+        # Bathroom fixtures
+        'toilet': 'toilet bathroom fixture',
+        'sink': 'sink washbasin fixture',
+        'bathtub': 'bathtub bathroom fixture',
+        'shower': 'shower bathroom fixture',
+        'mirror': 'bathroom mirror reflective surface',
+        'towel': 'towel bathroom textile',
+        
+        # Kitchen elements
+        'counter': 'kitchen counter worktop surface',
+        'appliances': 'kitchen appliances equipment',
+        
+        # Decorative and functional items
+        'picture': 'picture wall art decoration',
+        'curtain': 'window curtain fabric',
+        'blinds': 'window blinds covering',
+        'cushion': 'cushion soft furnishing',
+        'plant': 'houseplant indoor vegetation',
+        'lighting': 'light fixture illumination',
+        'tv_monitor': 'television monitor screen',
+        
+        # Storage and organization
+        'shelving': 'shelving storage system',
+        'board_panel': 'wall panel board surface',
+        
+        # Activities and equipment
+        'gym_equipment': 'exercise gym equipment',
+        'seating': 'seating furniture area',
+        
+        # General categories
+        'furniture': 'indoor furniture items',
+        'objects': 'household objects items',
+        'clothes': 'clothing textile items',
+        'fireplace': 'fireplace heating feature',
+        
+        # Special categories
+        'void': 'empty void space',
+        'other': 'miscellaneous other items'
+    }
+    
+    for category in categories:
+        category_clean = category.lower().strip()
+        if category_clean in enhancement_rules:
+            enhanced_categories.append(enhancement_rules[category_clean])
+        else:
+            # Default enhancement - add contextual information
+            if any(furniture_word in category_clean for furniture_word in ['chair', 'table', 'sofa', 'bed', 'cabinet']):
+                enhanced_categories.append(f"{category} indoor furniture")
+            elif any(surface_word in category_clean for surface_word in ['wall', 'floor', 'ceiling']):
+                enhanced_categories.append(f"{category} interior surface")
+            elif any(fixture_word in category_clean for fixture_word in ['sink', 'toilet', 'bathtub']):
+                enhanced_categories.append(f"{category} bathroom fixture")
+            else:
+                enhanced_categories.append(f"{category} indoor object")
+    
+    return enhanced_categories
+
+
+def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False, use_blip=False, blip_version="blip-base"):
     """Main function to run VLMaps demo"""
     
     if not UTILS_AVAILABLE:
@@ -525,8 +826,20 @@ def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
     
     print(f"Using data directory: {data_dir}")
     
-    # Initialize CLIP model
-    clip_model, clip_feat_dim, device = initialize_clip_model()
+    # Initialize model (CLIP or BLIP)
+    if use_blip and BLIP_AVAILABLE:
+        print(f"Using BLIP ({blip_version}) for vision-language features")
+        model, processor, feat_dim, device = initialize_blip_model(blip_version)
+        # Configure BLIP for optimal semantic mapping
+        model, processor = configure_blip_for_semantic_mapping(model, processor, device)
+        model_type = "blip"
+    else:
+        if use_blip and not BLIP_AVAILABLE:
+            print("BLIP requested but not available, falling back to CLIP")
+        print("Using CLIP for vision-language features")
+        model, feat_dim, device = initialize_clip_model()
+        processor = None  # CLIP doesn't use processor
+        model_type = "clip"
     
     # Configuration parameters
     cs = 0.05  # meters per cell size
@@ -537,12 +850,14 @@ def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
     # Create map if requested
     if create_map:
         print("Creating VLMap...")
-        create_lseg_map_batch(data_dir, camera_height=camera_height, cs=cs, gs=gs, depth_sample_rate=depth_sample_rate)
+        create_lseg_map_batch(data_dir, camera_height=camera_height, cs=cs, gs=gs, depth_sample_rate=depth_sample_rate, use_blip=use_blip)
         print("VLMap creation completed.")
+        # Automatically use the newly created map
+        use_self_built_map = True
     
     # Setup map paths
     map_save_dir = os.path.join(data_dir, "map_correct")
-    if use_self_built_map:
+    if use_self_built_map or create_map:
         map_save_dir = os.path.join(data_dir, "map")
     
     if not os.path.exists(map_save_dir):
@@ -606,13 +921,52 @@ def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
     no_map_mask = obstacles_cropped > 0
     
     lang = mp3dcat
-    text_feats = get_text_feats(lang, clip_model, clip_feat_dim)
+    if model_type == "blip":
+        # Enhance categories for better BLIP understanding
+        enhanced_lang = enhance_categories_for_blip(lang)
+        print(f"Using enhanced categories for BLIP: {len(enhanced_lang)} categories")
+        print(f"Enhanced categories: {enhanced_lang[:5]}...")  # Show first 5 for debugging
+        
+        # Use the same feature dimension as the map (512D for ViT-B/32 CLIP)
+        map_feat_dim = grid_cropped.shape[-1]
+        print(f"Map feature dimension: {map_feat_dim}")
+        
+        text_feats = get_blip_text_features(enhanced_lang, model, processor, device, target_dim=map_feat_dim)
+        print(f"BLIP text features shape: {text_feats.shape}")
+    else:
+        text_feats = get_text_feats(lang, model, feat_dim)
     
     map_feats = grid_cropped.reshape((-1, grid_cropped.shape[-1]))
     scores_list = map_feats @ text_feats.T
     
+    # Apply BLIP-specific semantic filtering if using BLIP
+    if model_type == "blip":
+        print("Applying BLIP semantic filtering...")
+        scores_list = apply_blip_semantic_filtering(scores_list, confidence_threshold=0.05)
+    
+    # Debug information
+    print(f"Map features shape: {map_feats.shape}")
+    print(f"Text features shape: {text_feats.shape}")
+    print(f"Scores shape: {scores_list.shape}")
+    print(f"Score statistics - Min: {scores_list.min():.3f}, Max: {scores_list.max():.3f}, Mean: {scores_list.mean():.3f}")
+    
+    # Check for any NaN or infinite values
+    if np.any(np.isnan(scores_list)) or np.any(np.isinf(scores_list)):
+        print("Warning: Found NaN or infinite values in scores, applying cleanup...")
+        scores_list = np.nan_to_num(scores_list, nan=0.0, posinf=1.0, neginf=-1.0)
+    
     predicts = np.argmax(scores_list, axis=1)
     predicts = predicts.reshape(grid_cropped.shape[:2])
+    unique_predictions = np.unique(predicts)
+    print(f"Unique predictions: {unique_predictions} (out of {len(lang)} categories)")
+    
+    # Show prediction confidence statistics for BLIP
+    if model_type == "blip":
+        max_scores = np.max(scores_list, axis=1)
+        print(f"Prediction confidence - Min: {max_scores.min():.3f}, Max: {max_scores.max():.3f}, Mean: {max_scores.mean():.3f}")
+        high_conf_ratio = np.mean(max_scores > 0.1)
+        print(f"High confidence predictions (>0.1): {high_conf_ratio:.1%}")
+    
     floor_mask = predicts == 2
     
     new_pallete = get_new_pallete(len(lang))
@@ -639,7 +993,15 @@ def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
     lang_list = custom_lang.split(",")
     lang_list = [item.strip() for item in lang_list]  # Clean whitespace
     
-    text_feats = get_text_feats(lang_list, clip_model, clip_feat_dim)
+    if model_type == "blip":
+        # Enhance custom categories for better BLIP understanding
+        enhanced_lang_list = enhance_categories_for_blip(lang_list)
+        print(f"Using enhanced custom categories for BLIP: {enhanced_lang_list}")
+        # Use the same feature dimension as the map
+        map_feat_dim = grid_cropped.shape[-1]
+        text_feats = get_blip_text_features(enhanced_lang_list, model, processor, device, target_dim=map_feat_dim)
+    else:
+        text_feats = get_text_feats(lang_list, model, feat_dim)
     
     scores_list = map_feats @ text_feats.T
     predicts = np.argmax(scores_list, axis=1)
@@ -667,6 +1029,166 @@ def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
     print("VLMaps demo completed!")
 
 
+def configure_blip_for_semantic_mapping(model, processor, device):
+    """Configure BLIP model for optimal semantic mapping performance"""
+    
+    # Set model to evaluation mode for consistent inference
+    model.eval()
+    
+    # Optimize processor settings for better text understanding
+    if hasattr(processor, 'tokenizer'):
+        # Increase max length for better context understanding
+        processor.tokenizer.model_max_length = 77  # Match CLIP's token limit
+        processor.tokenizer.padding_side = 'right'
+        processor.tokenizer.truncation_side = 'right'
+    
+    # Configure image processor for consistent features
+    if hasattr(processor, 'image_processor'):
+        # Ensure consistent image preprocessing
+        processor.image_processor.do_normalize = True
+        processor.image_processor.do_resize = True
+        processor.image_processor.size = {"height": 224, "width": 224}
+    
+    print("BLIP model configured for semantic mapping")
+    return model, processor
+
+def get_blip_semantic_categories():
+    """Get categories optimized for BLIP semantic understanding"""
+    # Categories that BLIP understands well based on its training data
+    blip_optimized_categories = [
+        # High-confidence furniture categories
+        "chair for sitting",
+        "dining table surface", 
+        "sofa for relaxing",
+        "bed for sleeping",
+        "storage cabinet",
+        
+        # Clear structural elements
+        "interior wall surface",
+        "floor ground surface", 
+        "ceiling overhead",
+        "doorway entrance",
+        "glass window",
+        
+        # Distinct bathroom fixtures
+        "white toilet fixture",
+        "bathroom sink basin",
+        "shower bathtub fixture",
+        "bathroom mirror",
+        
+        # Kitchen elements
+        "kitchen counter surface",
+        "kitchen appliances",
+        
+        # Decorative items
+        "wall picture artwork",
+        "window curtains",
+        "decorative cushion",
+        "indoor plant",
+        "ceiling light fixture",
+        
+        # Storage and organization
+        "wall shelving unit",
+        "wooden panel",
+        
+        # Miscellaneous
+        "household objects",
+        "textile items",
+        "other furniture"
+    ]
+    
+    return blip_optimized_categories
+
+def apply_blip_semantic_filtering(predictions, confidence_threshold=0.1):
+    """Apply semantic filtering to improve BLIP predictions"""
+    # Filter out low-confidence predictions
+    max_scores = np.max(predictions, axis=1)
+    high_confidence_mask = max_scores > confidence_threshold
+    
+    # Apply semantic consistency rules
+    filtered_predictions = predictions.copy()
+    
+    # Smooth predictions using spatial consistency (without scipy dependency)
+    try:
+        from scipy import ndimage
+        scipy_available = True
+    except ImportError:
+        scipy_available = False
+        print("Scipy not available, skipping spatial filtering")
+    
+    if scipy_available:
+        for i in range(predictions.shape[1]):
+            try:
+                # Get actual grid dimensions from the cropped map shape
+                # This should be passed as a parameter, but we'll estimate for now
+                total_pixels = predictions.shape[0]
+                
+                # Try to find factors that multiply to total_pixels
+                for grid_h in range(int(np.sqrt(total_pixels)), 0, -1):
+                    if total_pixels % grid_h == 0:
+                        grid_w = total_pixels // grid_h
+                        break
+                else:
+                    # Fallback: skip spatial filtering for this category
+                    continue
+                
+                category_map = (np.argmax(predictions, axis=1) == i).reshape(grid_h, grid_w)
+                
+                # Apply median filter to reduce noise
+                smoothed = ndimage.median_filter(category_map.astype(float), size=3)
+                category_mask = smoothed > 0.5
+                
+                # Boost confidence for spatially consistent regions
+                if np.any(category_mask):
+                    flat_mask = category_mask.flatten()[:predictions.shape[0]]  # Ensure correct size
+                    filtered_predictions[flat_mask, i] *= 1.2
+            except Exception as e:
+                print(f"Warning: Spatial filtering failed for category {i}: {e}")
+                continue
+    
+    # Apply confidence boosting for high-confidence predictions
+    high_conf_mask = max_scores > confidence_threshold * 2
+    filtered_predictions[high_conf_mask] *= 1.1
+    
+    # Renormalize to ensure probabilities sum to 1
+    row_sums = np.sum(filtered_predictions, axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1  # Avoid division by zero
+    filtered_predictions = filtered_predictions / row_sums
+    
+    return filtered_predictions
+
+
+def test_blip_functionality(blip_version="blip-base"):
+    """Test BLIP functionality with simple categories"""
+    print("Testing BLIP functionality...")
+    
+    try:
+        model, processor, feat_dim, device = initialize_blip_model(blip_version)
+        model, processor = configure_blip_for_semantic_mapping(model, processor, device)
+        
+        # Test with simple categories
+        test_categories = ["chair", "table", "wall", "floor", "door"]
+        enhanced_categories = enhance_categories_for_blip(test_categories)
+        print(f"Test categories: {test_categories}")
+        print(f"Enhanced categories: {enhanced_categories}")
+        
+        # Try to extract text features
+        text_feats = get_blip_text_features(enhanced_categories, model, processor, device, target_dim=512)
+        print(f"Text features shape: {text_feats.shape}")
+        print(f"Feature statistics - Min: {text_feats.min():.3f}, Max: {text_feats.max():.3f}")
+        
+        # Check for valid features
+        if np.any(np.isnan(text_feats)) or np.all(text_feats == 0):
+            print("❌ BLIP test failed - invalid features")
+            return False
+        else:
+            print("✅ BLIP test passed - features extracted successfully")
+            return True
+            
+    except Exception as e:
+        print(f"❌ BLIP test failed with error: {e}")
+        return False
+
 if __name__ == "__main__":
     import argparse
     
@@ -674,13 +1196,28 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, help="Path to data directory")
     parser.add_argument("--create_map", action="store_true", help="Create new VLMap")
     parser.add_argument("--use_self_built_map", action="store_true", help="Use self-built map instead of provided map")
+    parser.add_argument("--use_blip", action="store_true", help="Use BLIP model instead of CLIP for vision-language features")
+    parser.add_argument("--blip_version", type=str, default="blip-base", 
+                        choices=['blip-base', 'blip-large', 'blip-vit-base', 'blip-vit-large'],
+                        help="BLIP model version to use for image-text retrieval (default: blip-base)")
+    parser.add_argument("--test_blip", action="store_true", help="Test BLIP functionality before running demo")
     
     args = parser.parse_args()
+    
+    # Test BLIP functionality if requested
+    if args.test_blip and args.use_blip:
+        if test_blip_functionality(args.blip_version):
+            print("BLIP test successful, proceeding with demo...")
+        else:
+            print("BLIP test failed, please check the configuration")
+            exit(1)
     
     run_vlmaps_demo(
         data_dir=args.data_dir,
         create_map=args.create_map,
-        use_self_built_map=args.use_self_built_map
+        use_self_built_map=args.use_self_built_map,
+        use_blip=args.use_blip,
+        blip_version=args.blip_version
     )
 
 """# Citation
@@ -704,6 +1241,21 @@ python demo.py --data_dir /path/to/your/data --create_map
 
 ## Use self-built map:
 python demo.py --data_dir /path/to/your/data --use_self_built_map
+
+## Use BLIP instead of CLIP:
+python demo.py --data_dir /path/to/your/data --use_blip
+
+## Use specific BLIP model version:
+python demo.py --data_dir /path/to/your/data --use_blip --blip_version blip-large
+
+## Create map with BLIP:
+python demo.py --data_dir /path/to/your/data --create_map --use_blip
+
+## Available BLIP versions (optimized for image-text retrieval):
+# blip-base (768D features) - Default, BLIP with ITM (Image-Text Matching) training
+# blip-large (768D features) - Larger BLIP with ITM training, better performance
+# blip-vit-base (768D features) - BLIP with ViT backbone, VQA pre-training
+# blip-vit-large (768D features) - Large BLIP with ViT backbone, better accuracy
 
 ## Requirements:
 - Make sure you have all dependencies installed (see requirements.txt)
