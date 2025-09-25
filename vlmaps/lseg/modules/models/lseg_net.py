@@ -191,7 +191,12 @@ class LSeg(BaseModel):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        pixel_encoding = self.logit_scale * image_features.half() 
+        # Ensure consistent precision for CPU compatibility
+        if image_features.device.type == 'cpu':
+            pixel_encoding = self.logit_scale * image_features.float()
+            text_features = text_features.float()
+        else:
+            pixel_encoding = self.logit_scale * image_features.half()
         
         logits_per_image = pixel_encoding @ text_features.t()
 
@@ -318,7 +323,12 @@ class LSegEnc(BaseModel):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        pixel_encoding = self.logit_scale * image_features.half() 
+        # Ensure consistent precision for CPU compatibility
+        if image_features.device.type == 'cpu':
+            pixel_encoding = self.logit_scale * image_features.float()
+            text_features = text_features.float()
+        else:
+            pixel_encoding = self.logit_scale * image_features.half()
         
         logits_per_image = pixel_encoding @ text_features.t()
         pixel_encoding = pixel_encoding.float().view(imshape[0], imshape[2], imshape[3], -1).permute(0,3,1,2)

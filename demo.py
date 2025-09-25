@@ -172,7 +172,7 @@ data_dir = "/content/5LpN3gDmAk7_1/" # @param {type: "string"}
 # Default configuration - can be modified as needed
 
 # Define create_lseg_map_batch function 
-def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_sample_rate=100, use_blip=False):
+def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_sample_rate=100, use_blip=True):
     if not UTILS_AVAILABLE:
         raise ImportError("LSeg utilities not available. Please install dependencies.")
         
@@ -189,27 +189,67 @@ def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_s
     clip_version = "ViT-B/32"
     clip_feat_dim = {'RN50': 1024, 'RN101': 512, 'RN50x4': 640, 'RN50x16': 768,
                     'RN50x64': 1024, 'ViT-B/32': 512, 'ViT-B/16': 512, 'ViT-L/14': 768}[clip_version]
-    print("Loading CLIP model...")
-    clip_model, preprocess = clip.load(clip_version)  # clip.available_models()
-    clip_model.to(device).eval()
-    lang_token = clip.tokenize(labels)
-    lang_token = lang_token.to(device)
-    with torch.no_grad():
-        text_feats = clip_model.encode_text(lang_token)
-        text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
-    text_feats = text_feats.cpu().numpy()
+    
+    if use_blip and BLIP_AVAILABLE:
+        print("Loading BLIP model for text features...")
+        # Initialize BLIP model for text understanding
+        blip_model, blip_processor, blip_feat_dim, blip_device = initialize_blip_model()
+        
+        # Get enhanced labels for better BLIP understanding
+        enhanced_labels = enhance_categories_for_blip(labels)
+        print(f"Using enhanced labels: {enhanced_labels}")
+        
+        # Get text features using BLIP with target dimension matching CLIP
+        text_feats = get_blip_text_features(enhanced_labels, blip_model, blip_processor, blip_device, target_dim=clip_feat_dim)
+        print(f"BLIP text features shape: {text_feats.shape}")
+        
+        # Still need CLIP model for LSeg visual processing (minimal usage)
+        print("Loading minimal CLIP model for LSeg visual processing...")
+        clip_model, preprocess = clip.load(clip_version)
+        clip_model.to(device).eval()
+        if device == "cpu":
+            clip_model = clip_model.float()
+            for param in clip_model.parameters():
+                param.data = param.data.float()
+    else:
+        print("Loading CLIP model...")
+        clip_model, preprocess = clip.load(clip_version)  # clip.available_models()
+        clip_model.to(device).eval()
+        
+        # Ensure float32 precision for CPU compatibility
+        if device == "cpu":
+            clip_model = clip_model.float()
+            for param in clip_model.parameters():
+                param.data = param.data.float()
+        
+        lang_token = clip.tokenize(labels)
+        lang_token = lang_token.to(device)
+        with torch.no_grad():
+            text_feats = clip_model.encode_text(lang_token)
+            # Ensure float32 for CPU
+            if device == "cpu":
+                text_feats = text_feats.float()
+            text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
+        text_feats = text_feats.cpu().numpy()
     model = LSegEncNet(lang, arch_option=0,
                         block_depth=0,
                         activation='lrelu',
                         crop_size=crop_size)
     model_state_dict = model.state_dict()
-    pretrained_state_dict = torch.load("lseg/checkpoints/demo_e200.ckpt")
+    map_location = torch.device('cpu') if not torch.cuda.is_available() else None
+    pretrained_state_dict = torch.load("lseg/checkpoints/demo_e200.ckpt", map_location=map_location)
     pretrained_state_dict = {k.lstrip('net.'): v for k, v in pretrained_state_dict['state_dict'].items()}
     model_state_dict.update(pretrained_state_dict)
     model.load_state_dict(pretrained_state_dict)
 
     model.eval()
-    model = model.cuda()
+    model = model.to(device)
+    
+    # Ensure float32 precision for CPU compatibility
+    if device == "cpu":
+        model = model.float()
+        for param in model.parameters():
+            param.data = param.data.float()
 
     norm_mean= [0.5, 0.5, 0.5]
     norm_std = [0.5, 0.5, 0.5]
@@ -401,7 +441,13 @@ if UTILS_AVAILABLE:
     def get_lseg_feat(model, image: np.array, labels, transform, crop_size=480, \
                      base_size=520, norm_mean=[0.5, 0.5, 0.5], norm_std=[0.5, 0.5, 0.5]):
         vis_image = image.copy()
-        image = transform(image).unsqueeze(0).cuda()
+        device = next(model.parameters()).device  # Get device from model
+        image = transform(image).unsqueeze(0).to(device)
+        
+        # Ensure float32 precision for CPU compatibility
+        if device.type == "cpu":
+            image = image.float()
+        
         img = image[0].permute(1,2,0)
         img = img * 0.5 + 0.5
 
@@ -424,6 +470,9 @@ if UTILS_AVAILABLE:
         if long_size <= crop_size:
             pad_img = pad_image(cur_img, norm_mean,
                                 norm_std, crop_size)
+            # Ensure float32 precision
+            if device.type == "cpu":
+                pad_img = pad_img.float()
             print(pad_img.shape)
             with torch.no_grad():
                 outputs, logits = model(pad_img, labels)
@@ -435,15 +484,19 @@ if UTILS_AVAILABLE:
                                     norm_std, crop_size)
             else:
                 pad_img = cur_img
+            
+            # Ensure float32 precision
+            if device.type == "cpu":
+                pad_img = pad_img.float()
+                
             _,_,ph,pw = pad_img.shape #.size()
             assert(ph >= height and pw >= width)
             h_grids = int(math.ceil(1.0 * (ph-crop_size)/stride)) + 1
             w_grids = int(math.ceil(1.0 * (pw-crop_size)/stride)) + 1
-            with torch.cuda.device_of(image):
-                with torch.no_grad():
-                    outputs = image.new().resize_(batch, model.out_c,ph,pw).zero_().cuda()
-                    logits_outputs = image.new().resize_(batch, len(labels),ph,pw).zero_().cuda()
-                count_norm = image.new().resize_(batch,1,ph,pw).zero_().cuda()
+            with torch.no_grad():
+                outputs = image.new().resize_(batch, model.out_c,ph,pw).zero_().to(device).float()
+                logits_outputs = image.new().resize_(batch, len(labels),ph,pw).zero_().to(device).float()
+            count_norm = image.new().resize_(batch,1,ph,pw).zero_().to(device).float()
             # grid evaluation
             for idh in range(h_grids):
                 for idw in range(w_grids):
@@ -455,6 +508,9 @@ if UTILS_AVAILABLE:
                     # pad if needed
                     pad_crop_img = pad_image(crop_img, norm_mean,
                                                 norm_std, crop_size)
+                    # Ensure float32 precision
+                    if device.type == "cpu":
+                        pad_crop_img = pad_crop_img.float()
                     with torch.no_grad():
                         output, logits = model(pad_crop_img, labels)
                     cropped = crop_image(output, 0, h1-h0, 0, w1-w0)
@@ -785,8 +841,8 @@ def enhance_categories_for_blip(categories):
     return enhanced_categories
 
 
-def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False, use_blip=False, blip_version="blip-base"):
-    """Main function to run VLMaps demo"""
+def run_vlmaps_demo(data_dir=None, create_map=True, use_self_built_map=False, use_blip=True, blip_version="blip-base"):
+    """Main function to run VLMaps demo - now defaults to using BLIP"""
     
     if not UTILS_AVAILABLE:
         print("Required utilities not available. Please install dependencies and run from vlmaps directory.")
@@ -1196,13 +1252,18 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, help="Path to data directory")
     parser.add_argument("--create_map", action="store_true", help="Create new VLMap")
     parser.add_argument("--use_self_built_map", action="store_true", help="Use self-built map instead of provided map")
-    parser.add_argument("--use_blip", action="store_true", help="Use BLIP model instead of CLIP for vision-language features")
+    parser.add_argument("--use_blip", action="store_true", default=True, help="Use BLIP model instead of CLIP for vision-language features (default: True)")
+    parser.add_argument("--use_clip", action="store_true", help="Use CLIP model instead of BLIP for vision-language features")
     parser.add_argument("--blip_version", type=str, default="blip-base", 
                         choices=['blip-base', 'blip-large', 'blip-vit-base', 'blip-vit-large'],
                         help="BLIP model version to use for image-text retrieval (default: blip-base)")
     parser.add_argument("--test_blip", action="store_true", help="Test BLIP functionality before running demo")
     
     args = parser.parse_args()
+    
+    # Handle BLIP vs CLIP selection (BLIP is now default)
+    if args.use_clip:
+        args.use_blip = False
     
     # Test BLIP functionality if requested
     if args.test_blip and args.use_blip:
