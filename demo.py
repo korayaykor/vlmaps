@@ -632,31 +632,46 @@ def get_blip_text_features(texts, model, processor, device, target_dim=512):
                 
                 for prompt in prompt_templates:
                     try:
-                        # Process text input
+                        # Process text input for BlipForImageTextRetrieval
                         inputs = processor(text=prompt, return_tensors="pt", padding=True, truncation=True, max_length=77)
                         inputs = {k: v.to(device) for k, v in inputs.items()}
                         
-                        # Extract text embeddings using the text encoder directly
-                        if hasattr(model, 'text_model'):
+                        # Use BlipForImageTextRetrieval's text encoder directly
+                        if hasattr(model, 'text_encoder'):
+                            # Standard BLIP ITM models have text_encoder
+                            text_outputs = model.text_encoder(
+                                input_ids=inputs['input_ids'],
+                                attention_mask=inputs['attention_mask'],
+                                return_dict=True
+                            )
+                            
+                            # Get pooled representation for retrieval tasks
+                            if hasattr(text_outputs, 'pooler_output') and text_outputs.pooler_output is not None:
+                                text_embeds = text_outputs.pooler_output
+                            else:
+                                # Use CLS token if pooler not available
+                                text_embeds = text_outputs.last_hidden_state[:, 0, :]
+                                
+                        elif hasattr(model, 'text_model'):
                             # For BLIP-2 style models
-                            text_outputs = model.text_model(**inputs)
+                            text_outputs = model.text_model(
+                                input_ids=inputs['input_ids'],
+                                attention_mask=inputs['attention_mask'],
+                                return_dict=True
+                            )
+                            
                             if hasattr(text_outputs, 'pooler_output') and text_outputs.pooler_output is not None:
                                 text_embeds = text_outputs.pooler_output
                             else:
                                 text_embeds = text_outputs.last_hidden_state.mean(dim=1)
-                        elif hasattr(model, 'text_encoder'):
-                            # For standard BLIP models
-                            text_outputs = model.text_encoder(**inputs)
-                            if hasattr(text_outputs, 'pooler_output') and text_outputs.pooler_output is not None:
-                                text_embeds = text_outputs.pooler_output
-                            else:
-                                text_embeds = text_outputs.last_hidden_state[:, 0, :]  # CLS token
                         else:
-                            # Fallback: use the complete model with dummy image
+                            # Fallback: use the complete BlipForImageTextRetrieval model
+                            # Create dummy image for text-only feature extraction
                             dummy_image = torch.zeros(1, 3, 224, 224).to(device)
                             dummy_inputs = processor(images=dummy_image, return_tensors="pt")
                             dummy_inputs = {k: v.to(device) for k, v in dummy_inputs.items()}
                             
+                            # Forward pass through BlipForImageTextRetrieval
                             outputs = model(
                                 pixel_values=dummy_inputs['pixel_values'],
                                 input_ids=inputs['input_ids'],
@@ -664,10 +679,21 @@ def get_blip_text_features(texts, model, processor, device, target_dim=512):
                                 return_dict=True
                             )
                             
+                            # Extract text features from ITM output
                             if hasattr(outputs, 'text_embeds'):
                                 text_embeds = outputs.text_embeds
+                            elif hasattr(outputs, 'last_hidden_state'):
+                                text_embeds = outputs.last_hidden_state[:, 0, :]  # CLS token
                             else:
                                 continue  # Skip this prompt if we can't extract embeddings
+                        
+                        # Apply ITM projection if available (specific to retrieval models)
+                        if hasattr(model, 'text_proj') and model.text_proj is not None:
+                            text_embeds = model.text_proj(text_embeds)
+                        elif hasattr(model, 'itm_head') and hasattr(model.itm_head, 'weight'):
+                            # Some ITM models have a different projection structure
+                            # Use the ITM head weights for projection (without bias)
+                            text_embeds = torch.nn.functional.linear(text_embeds, model.itm_head.weight.T)
                         
                         text_embeds_list.append(text_embeds)
                         
@@ -679,11 +705,7 @@ def get_blip_text_features(texts, model, processor, device, target_dim=512):
                     # Average embeddings from multiple prompts for robustness
                     text_embeds = torch.stack(text_embeds_list).mean(dim=0)
                     
-                    # Apply text projection if available
-                    if hasattr(model, 'text_proj') and model.text_proj is not None:
-                        text_embeds = model.text_proj(text_embeds)
-                    
-                    # Project to target dimension if needed
+                    # Project to target dimension if needed (for compatibility with map features)
                     if text_embeds.shape[-1] != target_dim:
                         if get_blip_text_features.projection_layer is None:
                             get_blip_text_features.projection_layer = torch.nn.Linear(
@@ -694,7 +716,7 @@ def get_blip_text_features(texts, model, processor, device, target_dim=512):
                         
                         text_embeds = get_blip_text_features.projection_layer(text_embeds)
                     
-                    # Normalize features for cosine similarity
+                    # Normalize features for cosine similarity (important for retrieval)
                     text_embeds = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-8)
                     text_features.append(text_embeds.cpu().numpy())
                 else:
@@ -710,7 +732,7 @@ def get_blip_text_features(texts, model, processor, device, target_dim=512):
     return np.vstack(text_features)
 
 def get_blip_image_features(image, model, processor, device):
-    """Get image features using BLIP for image-text retrieval"""
+    """Get image features using BlipForImageTextRetrieval - optimized for retrieval tasks"""
     with torch.no_grad():
         # Convert numpy array to PIL Image if needed
         if isinstance(image, np.ndarray):
@@ -718,28 +740,48 @@ def get_blip_image_features(image, model, processor, device):
         else:
             image_pil = image
             
+        # Process image input for BlipForImageTextRetrieval
         inputs = processor(images=image_pil, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # BlipForImageTextRetrieval has a specific vision encoder
+        # Extract image features using BlipForImageTextRetrieval's vision encoder
         if hasattr(model, 'vision_model'):
-            # Use the vision model directly
-            image_outputs = model.vision_model(**inputs)
-            image_embeds = image_outputs.pooler_output
+            # Use the vision model directly (preferred for ITM models)
+            image_outputs = model.vision_model(
+                pixel_values=inputs['pixel_values'],
+                return_dict=True
+            )
             
-            # Apply vision projection if available
-            if hasattr(model, 'visual_projection'):
-                image_embeds = model.visual_projection(image_embeds)
+            # Get pooled representation for retrieval tasks
+            if hasattr(image_outputs, 'pooler_output') and image_outputs.pooler_output is not None:
+                image_embeds = image_outputs.pooler_output
+            else:
+                # Use CLS token if pooler not available
+                image_embeds = image_outputs.last_hidden_state[:, 0, :]
+                
+        elif hasattr(model, 'visual_encoder'):
+            # Alternative naming for vision encoder in some BLIP variants
+            image_outputs = model.visual_encoder(
+                pixel_values=inputs['pixel_values'],
+                return_dict=True
+            )
+            
+            if hasattr(image_outputs, 'pooler_output') and image_outputs.pooler_output is not None:
+                image_embeds = image_outputs.pooler_output
+            else:
+                image_embeds = image_outputs.last_hidden_state[:, 0, :]
                 
         elif hasattr(model, 'get_image_features'):
-            # Fallback method if available
-            image_embeds = model.get_image_features(**inputs)
+            # Direct method if available
+            image_embeds = model.get_image_features(pixel_values=inputs['pixel_values'])
+            
         else:
-            # Alternative approach using the full model with dummy text
+            # Fallback: use the complete BlipForImageTextRetrieval model
             dummy_text = "a photo"
-            text_inputs = processor(text=dummy_text, return_tensors="pt")
+            text_inputs = processor(text=dummy_text, return_tensors="pt", padding=True, truncation=True)
             text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
             
+            # Forward pass through BlipForImageTextRetrieval
             outputs = model(
                 pixel_values=inputs['pixel_values'],
                 input_ids=text_inputs['input_ids'],
@@ -747,23 +789,124 @@ def get_blip_image_features(image, model, processor, device):
                 return_dict=True
             )
             
+            # Extract image features from ITM output
             if hasattr(outputs, 'image_embeds'):
                 image_embeds = outputs.image_embeds
-            else:
-                # Use vision embeddings as image representation
+            elif hasattr(outputs, 'vision_embeds'):
                 image_embeds = outputs.vision_embeds
+            else:
+                raise ValueError("Could not extract image features from BlipForImageTextRetrieval model")
         
-        # Normalize features for better similarity computation
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        # Apply ITM-specific vision projection if available
+        if hasattr(model, 'vision_proj') and model.vision_proj is not None:
+            image_embeds = model.vision_proj(image_embeds)
+        elif hasattr(model, 'visual_projection') and model.visual_projection is not None:
+            image_embeds = model.visual_projection(image_embeds)
+        elif hasattr(model, 'itm_head') and hasattr(model.itm_head, 'weight'):
+            # Some ITM models have different projection structure
+            # Project through ITM head for retrieval compatibility
+            image_embeds = torch.nn.functional.linear(image_embeds, model.itm_head.weight.T)
+        
+        # Normalize features for retrieval (cosine similarity)
+        image_embeds = image_embeds / (image_embeds.norm(dim=-1, keepdim=True) + 1e-8)
+        
         return image_embeds.cpu().numpy()
 
+def get_blip_itm_scores(image, texts, model, processor, device):
+    """
+    Get image-text matching scores using BlipForImageTextRetrieval
+    This leverages the specific ITM (Image-Text Matching) capabilities of the model
+    """
+    with torch.no_grad():
+        # Convert numpy array to PIL Image if needed
+        if isinstance(image, np.ndarray):
+            image_pil = Image.fromarray(image)
+        else:
+            image_pil = image
+        
+        itm_scores = []
+        
+        for text in texts:
+            try:
+                # Process both image and text together for ITM scoring
+                inputs = processor(
+                    images=image_pil, 
+                    text=text, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True,
+                    max_length=77
+                )
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Forward pass through BlipForImageTextRetrieval for ITM scoring
+                outputs = model(**inputs, return_dict=True)
+                
+                # Extract ITM score (probability of image-text matching)
+                if hasattr(outputs, 'itm_score'):
+                    # Direct ITM score
+                    itm_score = outputs.itm_score
+                elif hasattr(outputs, 'logits'):
+                    # ITM logits (usually 2-class: match/no-match)
+                    itm_logits = outputs.logits
+                    # Apply softmax and take the "match" probability
+                    itm_score = torch.softmax(itm_logits, dim=-1)[:, 1]  # Index 1 for "match"
+                else:
+                    # Fallback: compute similarity between image and text embeddings
+                    image_embeds = get_blip_image_features(image_pil, model, processor, device)
+                    text_inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True)
+                    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+                    
+                    # Get text embeddings
+                    if hasattr(model, 'text_encoder'):
+                        text_outputs = model.text_encoder(**text_inputs, return_dict=True)
+                        if hasattr(text_outputs, 'pooler_output'):
+                            text_embeds = text_outputs.pooler_output
+                        else:
+                            text_embeds = text_outputs.last_hidden_state[:, 0, :]
+                    else:
+                        continue
+                    
+                    # Compute cosine similarity as ITM score
+                    image_embeds_tensor = torch.from_numpy(image_embeds).to(device)
+                    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+                    itm_score = torch.cosine_similarity(image_embeds_tensor, text_embeds, dim=-1)
+                
+                itm_scores.append(itm_score.cpu().numpy())
+                
+            except Exception as e:
+                print(f"Error computing ITM score for text '{text}': {e}")
+                # Add zero score for failed computation
+                itm_scores.append(np.array([0.0]))
+        
+        return np.concatenate(itm_scores) if itm_scores else np.array([])
+
 def enhance_categories_for_blip(categories):
-    """Enhance category names for better BLIP understanding in semantic mapping"""
+    """Enhance category names for better BLIP understanding in semantic mapping
+    
+    Limited to MP3D categories only, similar to how CLIP is limited to work with specific categories.
+    Only categories that exist in MP3D dataset will be enhanced, others will be skipped or mapped to 'other'.
+    """
+    # Import MP3D categories for validation
+    try:
+        from vlmaps.utils.matterport3d_categories import mp3dcat
+        valid_mp3d_categories = set([cat.lower().strip() for cat in mp3dcat])
+    except ImportError:
+        # Fallback MP3D categories if import fails
+        valid_mp3d_categories = set([
+            "void", "wall", "floor", "chair", "door", "table", "picture", "cabinet", 
+            "cushion", "window", "sofa", "bed", "curtain", "chest_of_drawers", "plant", 
+            "sink", "stairs", "ceiling", "toilet", "stool", "towel", "mirror", 
+            "tv_monitor", "shower", "column", "bathtub", "counter", "fireplace", 
+            "lighting", "beam", "railing", "shelving", "blinds", "gym_equipment", 
+            "seating", "board_panel", "furniture", "appliances", "clothes", "objects"
+        ])
+    
     enhanced_categories = []
     
-    # Category enhancement rules based on semantic mapping requirements
-    enhancement_rules = {
-        # Furniture items
+    # Enhancement rules - ONLY for MP3D categories
+    mp3d_enhancement_rules = {
+        # Furniture items (MP3D)
         'chair': 'chair furniture for sitting',
         'table': 'table furniture surface',
         'sofa': 'sofa couch furniture for sitting',
@@ -771,8 +914,10 @@ def enhance_categories_for_blip(categories):
         'cabinet': 'cabinet storage furniture',
         'chest_of_drawers': 'chest of drawers storage furniture',
         'stool': 'stool seat furniture',
+        'furniture': 'indoor furniture items',
+        'seating': 'seating furniture area',
         
-        # Structural elements
+        # Structural elements (MP3D)
         'wall': 'wall interior surface',
         'floor': 'floor ground surface',
         'ceiling': 'ceiling overhead surface',
@@ -783,7 +928,7 @@ def enhance_categories_for_blip(categories):
         'beam': 'ceiling beam structure',
         'railing': 'stair railing barrier',
         
-        # Bathroom fixtures
+        # Bathroom fixtures (MP3D)
         'toilet': 'toilet bathroom fixture',
         'sink': 'sink washbasin fixture',
         'bathtub': 'bathtub bathroom fixture',
@@ -791,11 +936,11 @@ def enhance_categories_for_blip(categories):
         'mirror': 'bathroom mirror reflective surface',
         'towel': 'towel bathroom textile',
         
-        # Kitchen elements
+        # Kitchen/Counter elements (MP3D)
         'counter': 'kitchen counter worktop surface',
         'appliances': 'kitchen appliances equipment',
         
-        # Decorative and functional items
+        # Decorative and functional items (MP3D)
         'picture': 'picture wall art decoration',
         'curtain': 'window curtain fabric',
         'blinds': 'window blinds covering',
@@ -803,40 +948,37 @@ def enhance_categories_for_blip(categories):
         'plant': 'houseplant indoor vegetation',
         'lighting': 'light fixture illumination',
         'tv_monitor': 'television monitor screen',
+        'fireplace': 'fireplace heating feature',
         
-        # Storage and organization
+        # Storage and organization (MP3D)
         'shelving': 'shelving storage system',
         'board_panel': 'wall panel board surface',
         
-        # Activities and equipment
+        # Activities and equipment (MP3D)
         'gym_equipment': 'exercise gym equipment',
-        'seating': 'seating furniture area',
         
-        # General categories
-        'furniture': 'indoor furniture items',
+        # General categories (MP3D)
         'objects': 'household objects items',
         'clothes': 'clothing textile items',
-        'fireplace': 'fireplace heating feature',
         
-        # Special categories
-        'void': 'empty void space',
-        'other': 'miscellaneous other items'
+        # Special categories (MP3D)
+        'void': 'empty void space'
     }
     
     for category in categories:
         category_clean = category.lower().strip()
-        if category_clean in enhancement_rules:
-            enhanced_categories.append(enhancement_rules[category_clean])
-        else:
-            # Default enhancement - add contextual information
-            if any(furniture_word in category_clean for furniture_word in ['chair', 'table', 'sofa', 'bed', 'cabinet']):
-                enhanced_categories.append(f"{category} indoor furniture")
-            elif any(surface_word in category_clean for surface_word in ['wall', 'floor', 'ceiling']):
-                enhanced_categories.append(f"{category} interior surface")
-            elif any(fixture_word in category_clean for fixture_word in ['sink', 'toilet', 'bathtub']):
-                enhanced_categories.append(f"{category} bathroom fixture")
+        
+        # Only enhance if category exists in MP3D dataset
+        if category_clean in valid_mp3d_categories:
+            if category_clean in mp3d_enhancement_rules:
+                enhanced_categories.append(mp3d_enhancement_rules[category_clean])
             else:
-                enhanced_categories.append(f"{category} indoor object")
+                # Use original category name if it's valid MP3D but no specific enhancement rule
+                enhanced_categories.append(f"{category} indoor item")
+        else:
+            # Skip categories not in MP3D or map them to 'other'
+            print(f"Warning: Category '{category}' not in MP3D categories, mapping to 'objects'")
+            enhanced_categories.append("household objects items")  # Map to MP3D 'objects' category
     
     return enhanced_categories
 
@@ -1086,74 +1228,86 @@ def run_vlmaps_demo(data_dir=None, create_map=True, use_self_built_map=False, us
 
 
 def configure_blip_for_semantic_mapping(model, processor, device):
-    """Configure BLIP model for optimal semantic mapping performance"""
+    """Configure BlipForImageTextRetrieval model for optimal semantic mapping performance"""
     
     # Set model to evaluation mode for consistent inference
     model.eval()
     
-    # Optimize processor settings for better text understanding
+    # Optimize processor settings for better text understanding in ITM tasks
     if hasattr(processor, 'tokenizer'):
         # Increase max length for better context understanding
         processor.tokenizer.model_max_length = 77  # Match CLIP's token limit
         processor.tokenizer.padding_side = 'right'
         processor.tokenizer.truncation_side = 'right'
     
-    # Configure image processor for consistent features
+    # Configure image processor for consistent features in ITM tasks
     if hasattr(processor, 'image_processor'):
-        # Ensure consistent image preprocessing
+        # Ensure consistent image preprocessing for retrieval
         processor.image_processor.do_normalize = True
         processor.image_processor.do_resize = True
         processor.image_processor.size = {"height": 224, "width": 224}
     
-    print("BLIP model configured for semantic mapping")
+    # Verify that this is indeed a BlipForImageTextRetrieval model
+    model_name = model.__class__.__name__
+    if "ImageTextRetrieval" not in model_name:
+        print(f"Warning: Expected BlipForImageTextRetrieval, but got {model_name}")
+    else:
+        print(f"BlipForImageTextRetrieval model configured for semantic mapping")
+    
     return model, processor
 
 def get_blip_semantic_categories():
-    """Get categories optimized for BLIP semantic understanding"""
-    # Categories that BLIP understands well based on its training data
-    blip_optimized_categories = [
-        # High-confidence furniture categories
-        "chair for sitting",
-        "dining table surface", 
-        "sofa for relaxing",
-        "bed for sleeping",
-        "storage cabinet",
-        
-        # Clear structural elements
-        "interior wall surface",
-        "floor ground surface", 
-        "ceiling overhead",
-        "doorway entrance",
-        "glass window",
-        
-        # Distinct bathroom fixtures
-        "white toilet fixture",
-        "bathroom sink basin",
-        "shower bathtub fixture",
-        "bathroom mirror",
-        
-        # Kitchen elements
-        "kitchen counter surface",
-        "kitchen appliances",
-        
-        # Decorative items
-        "wall picture artwork",
-        "window curtains",
-        "decorative cushion",
-        "indoor plant",
-        "ceiling light fixture",
-        
-        # Storage and organization
-        "wall shelving unit",
-        "wooden panel",
-        
-        # Miscellaneous
-        "household objects",
-        "textile items",
-        "other furniture"
-    ]
-    
-    return blip_optimized_categories
+    """Get categories optimized for BLIP semantic understanding - Limited to MP3D categories only"""
+    # Import MP3D categories to ensure consistency
+    try:
+        from vlmaps.utils.matterport3d_categories import mp3dcat
+        # Use MP3D categories as the base and enhance them for BLIP
+        return enhance_categories_for_blip(mp3dcat)
+    except ImportError:
+        # Fallback: manually define MP3D-compatible categories optimized for BLIP
+        mp3d_compatible_categories = [
+            "empty void space",
+            "wall interior surface",
+            "floor ground surface", 
+            "chair furniture for sitting",
+            "door entrance opening",
+            "table furniture surface",
+            "picture wall art decoration",
+            "cabinet storage furniture",
+            "cushion soft furnishing",
+            "window glass opening",
+            "sofa couch furniture for sitting",
+            "bed furniture for sleeping",
+            "window curtain fabric",
+            "chest of drawers storage furniture",
+            "houseplant indoor vegetation",
+            "sink washbasin fixture",
+            "stairs staircase steps",
+            "ceiling overhead surface",
+            "toilet bathroom fixture",
+            "stool seat furniture",
+            "towel bathroom textile",
+            "bathroom mirror reflective surface",
+            "television monitor screen",
+            "shower bathroom fixture",
+            "architectural column pillar",
+            "bathtub bathroom fixture",
+            "kitchen counter worktop surface",
+            "fireplace heating feature",
+            "light fixture illumination",
+            "ceiling beam structure",
+            "stair railing barrier",
+            "shelving storage system",
+            "window blinds covering",
+            "exercise gym equipment",
+            "seating furniture area",
+            "wall panel board surface",
+            "indoor furniture items",
+            "kitchen appliances equipment",
+            "clothing textile items",
+            "household objects items"
+        ]
+        return mp3d_compatible_categories
 
 def apply_blip_semantic_filtering(predictions, confidence_threshold=0.1):
     """Apply semantic filtering to improve BLIP predictions"""
