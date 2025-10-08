@@ -64,20 +64,22 @@ def generate_scene_data(save_dir: Union[Path, str], config: DictConfig, scene_pa
 def main(config: DictConfig) -> None:
     os.environ["MAGNUM_LOG"] = "quiet"
     os.environ["HABITAT_SIM_LOG"] = "quiet"
-    os.makedirs(config.data_paths.vlmaps_data_dir, exist_ok=True)
-    dataset_dir = Path(config.data_paths.vlmaps_data_dir)
+    
+    # Resolve the vlmaps_data_dir path (supports ~ expansion)
+    vlmaps_data_dir = Path(config.data_paths.vlmaps_data_dir).expanduser().resolve()
+    
+    os.makedirs(vlmaps_data_dir, exist_ok=True)
 
-
-    # The actual scene directories are inside vlmaps_dataset subdirectory
-    vlmaps_dataset_dir = dataset_dir / "vlmaps_dataset"
-    data_dirs = sorted([x for x in vlmaps_dataset_dir.iterdir() if x.is_dir()])
+    # The scene directories are directly in vlmaps_data_dir
+    data_dirs = sorted([x for x in vlmaps_data_dir.iterdir() if x.is_dir()])
     if config.scene_names:
-        data_dirs = sorted([dataset_dir / x for x in config.scene_names])
+        data_dirs = sorted([vlmaps_data_dir / x for x in config.scene_names])
     pbar = tqdm(data_dirs)
     for data_dir_i, data_dir in enumerate(pbar):
         pbar.set_description(desc=f"Scene {data_dir.name:14}")
         scene_name = data_dir.name.split("_")[0]
-        scene_path = Path(config.data_paths.habitat_scene_dir) / scene_name / (scene_name + ".glb")
+        habitat_scene_dir = Path(config.data_paths.habitat_scene_dir).expanduser().resolve()
+        scene_path = habitat_scene_dir / scene_name / (scene_name + ".glb")
         pose_path = data_dir / "poses.txt"
         poses = np.loadtxt(pose_path)  # (N, 7), each line has (px, py, pz, qx, qy, qz, qw)
         generate_scene_data(data_dir, config.data_cfg, scene_path, poses)
