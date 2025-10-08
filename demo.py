@@ -195,7 +195,7 @@ def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_s
                         activation='lrelu',
                         crop_size=crop_size)
     model_state_dict = model.state_dict()
-    pretrained_state_dict = torch.load("lseg/checkpoints/demo_e200.ckpt")
+    pretrained_state_dict = torch.load("vlmaps/lseg/checkpoints/demo_e200.ckpt")
     pretrained_state_dict = {k.lstrip('net.'): v for k, v in pretrained_state_dict['state_dict'].items()}
     model_state_dict.update(pretrained_state_dict)
     model.load_state_dict(pretrained_state_dict)
@@ -541,7 +541,7 @@ def run_vlmaps_demo(data_dir=None, create_map=False, use_self_built_map=False):
         print("VLMap creation completed.")
     
     # Setup map paths
-    map_save_dir = os.path.join(data_dir, "map_correct")
+    map_save_dir = os.path.join(data_dir, "map")
     if use_self_built_map:
         map_save_dir = os.path.join(data_dir, "map")
     
