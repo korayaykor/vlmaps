@@ -7,6 +7,5 @@ conda activate vlmaps && python dataset/generate_dataset.py
 
 After that create the semantic map with 
 
-conda activate vlmaps && python demo.py --data_dir vlmaps_data_dir/vlmaps_dataset/5LpN3gDmAk7_1
- --create_map --use_blip --blip_version blip-base
+conda activate vlmaps && python demo.py --data_dir vlmaps_data_dir/vlmaps_dataset/5LpN3gDmAk7_1 --create_map --use_blip --blip_version blip-base
 You can check the python demo.py --help to see other parameters.

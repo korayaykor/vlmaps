@@ -1,2 +1,2 @@
-habitat_scene_dir: "/home/koray/vlmaps/habitat_data_dir"
-vlmaps_data_dir: "vlmaps_data_dir"
+habitat_scene_dir: "/home/koray/vlmaps/habitat_scene_dir"
+vlmaps_data_dir: "/home/koray/vlmaps/vlmaps_data_dir/vlmaps_dataset"

@@ -165,6 +165,14 @@ class VLMapBuilder:
                     feat = pix_feats[0, :, py, px]
                     occupied_id = occupied_ids[row, col, height]
                     if occupied_id == -1:
+                        # Check if we need to expand the arrays
+                        if max_id >= grid_feat.shape[0]:
+                            new_size = grid_feat.shape[0] + gs * gs
+                            grid_feat = np.concatenate([grid_feat, np.zeros((gs * gs, self.clip_feat_dim), dtype=np.float32)])
+                            grid_pos = np.concatenate([grid_pos, np.zeros((gs * gs, 3), dtype=np.int32)])
+                            weight = np.concatenate([weight, np.zeros((gs * gs), dtype=np.float32)])
+                            grid_rgb = np.concatenate([grid_rgb, np.zeros((gs * gs, 3), dtype=np.uint8)])
+                        
                         occupied_ids[row, col, height] = max_id
                         grid_feat[max_id] = feat.flatten() * alpha
                         grid_rgb[max_id] = rgb_v

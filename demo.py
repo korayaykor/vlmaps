@@ -237,7 +237,7 @@ def create_lseg_map_batch(img_save_dir, camera_height, cs=0.05, gs=1000, depth_s
                         crop_size=crop_size)
     model_state_dict = model.state_dict()
     map_location = torch.device('cpu') if not torch.cuda.is_available() else None
-    pretrained_state_dict = torch.load("lseg/checkpoints/demo_e200.ckpt", map_location=map_location)
+    pretrained_state_dict = torch.load("vlmaps/lseg/checkpoints/demo_e200.ckpt", map_location=map_location)
     pretrained_state_dict = {k.lstrip('net.'): v for k, v in pretrained_state_dict['state_dict'].items()}
     model_state_dict.update(pretrained_state_dict)
     model.load_state_dict(pretrained_state_dict)
