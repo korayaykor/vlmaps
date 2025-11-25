@@ -20,5 +20,7 @@ vlmaps_data_dir/
 *logs
 rgb.mp4
 depth.mp4
+vlmaps_data_dir/
+habitat_scene_dir/
 outputs
 *.egg-info
